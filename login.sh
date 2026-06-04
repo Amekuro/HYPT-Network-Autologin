@@ -1,210 +1,262 @@
 #!/bin/sh
 
 # ======================= 配置区 =======================
-# 账号配置
 USERNAME="YOUR_ACCOUNT"
 PASSWORD="YOUR_PASSWORD"
+INTERFACES="wan"
 
-# 接口列表 (空格分隔)
-INTERFACES="wan vwan1"
-
-# 目标地址配置
-# PROBE_TARGET: 用于触发认证的内网劫持IP
 PROBE_TARGET="2.2.2.2"
-# AUTH_HOST: 认证服务器IP (用于路由绑定)
 AUTH_HOST="10.5.0.11"
-# AC_IP: AC控制器IP (登录参数用)
-AC_IP="10.5.0.12"
 
-# 浏览器标识
-UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-# 接口切换间隔 (秒)
+MAX_RETRIES=3
+RETRY_DELAY=2
 SLEEP_TIME=3
+UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
 # ======================================================
 
-# 引入 OpenWrt 网络函数库
 . /lib/functions/network.sh
 
-# --- 日志函数 ---
-log() {
-    local MSG="$(date '+%Y-%m-%d %H:%M:%S') - $1"
-    echo "$MSG"
-    # 非调试模式下写入系统日志，避免填满存储
-    if [ "$DEBUG_MODE" != "true" ]; then logger -t CampusLogin "$1"; fi
-}
-
-# --- 路由清理函数 (RAII 风格) ---
-# 参数: $1=设备名(eth0), $2=网关IP
-cleanup_routes() {
-    local DEV=$1
-    local GW=$2
-    # 仅当网关存在时才尝试删除
-    if [ -n "$GW" ]; then
-        # 删除探测IP的路由
-        ip route del "$PROBE_TARGET" via "$GW" dev "$DEV" >/dev/null 2>&1
-        # 删除认证服务器的路由
-        ip route del "$AUTH_HOST" via "$GW" dev "$DEV" >/dev/null 2>&1
-    fi
-}
-
-# --- 脚本入口处理 ---
-MODE="$1"       # 第一个参数: debug
-TARGET_IF="$2"  # 第二个参数: 指定接口 (例如 vwan1)
+# --- 日志模块 ---
+C_RESET='\033[0m'
+C_INFO='\033[36m'
+C_WARN='\033[33m'
+C_ERR='\033[31m'
+C_SUCC='\033[32m'
+C_DEBUG='\033[90m'
 
 DEBUG_MODE="false"
 FORCE_CHECK="false"
 
-if [ "$MODE" = "debug" ]; then
-    DEBUG_MODE="true"
-    FORCE_CHECK="true"
-    log ">>> 调试模式已开启 (详细日志 + 强制检查) <<<"
-fi
+log_sys() {
+    if [ "$DEBUG_MODE" != "true" ]; then 
+        logger -t CampusLogin "[$1] $2"
+    fi
+}
+log_info()  { echo -e "$(date '+%Y-%m-%d %H:%M:%S') ${C_INFO}[INFO]${C_RESET} $1"; log_sys "INFO" "$1"; }
+log_succ()  { echo -e "$(date '+%Y-%m-%d %H:%M:%S') ${C_SUCC}[SUCC]${C_RESET} $1"; log_sys "SUCC" "$1"; }
+log_warn()  { echo -e "$(date '+%Y-%m-%d %H:%M:%S') ${C_WARN}[WARN]${C_RESET} $1"; log_sys "WARN" "$1"; }
+log_err()   { echo -e "$(date '+%Y-%m-%d %H:%M:%S') ${C_ERR}[ERR]${C_RESET}  $1"; log_sys "ERR" "$1"; }
+log_debug() { [ "$DEBUG_MODE" = "true" ] && echo -e "$(date '+%Y-%m-%d %H:%M:%S') ${C_DEBUG}[DEBUG]${C_RESET} $1"; }
 
-if [ -n "$TARGET_IF" ]; then
-    INTERFACES="$TARGET_IF"
-    log ">>> 单接口模式: 仅处理 [$TARGET_IF] <<<"
-fi
 
-# 捕获退出信号 (Ctrl+C)，确保路由被清理
-trap 'echo "脚本中断，正在清理..."; exit 1' INT TERM
+# --- 核心功能函数 ---
 
-log "============ 开始认证流程 ============"
+# 显示帮助
+show_help() {
+    echo "用法: $0 [-d] [-h] [接口1 接口2 ...]"
+    echo "选项:"
+    echo "  -d    开启调试模式 (输出详细日志并强制探测)"
+    echo "  -h    显示此帮助信息"
+    exit 0
+}
 
+# 解析命令行参数
+parse_args() {
+    while getopts "dh" opt; do
+        case "$opt" in
+            d) DEBUG_MODE="true"; FORCE_CHECK="true" ;;
+            h) show_help ;;
+            \?) echo "无效选项。请使用 -h 查看帮助。"; exit 1 ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+    [ $# -gt 0 ] && INTERFACES="$*"
+}
+
+# 添加探测所需的单向路由
+setup_routes() {
+    local dev=$1
+    local gw=$2
+    if [ -n "$gw" ]; then
+        ip route add "$PROBE_TARGET" via "$gw" dev "$dev" >/dev/null 2>&1
+        ip route add "$AUTH_HOST" via "$gw" dev "$dev" >/dev/null 2>&1
+    fi
+}
+
+# 清理探测遗留的路由
+cleanup_routes() {
+    local dev=$1
+    local gw=$2
+    if [ -n "$gw" ]; then
+        ip route del "$PROBE_TARGET" via "$gw" dev "$dev" >/dev/null 2>&1
+        ip route del "$AUTH_HOST" via "$gw" dev "$dev" >/dev/null 2>&1
+    fi
+}
+
+# 获取并校验网卡物理信息
+# 说明: 基于 Shell 特性，提取的数据存入全局变量 CURRENT_DEV, CURRENT_IP, CURRENT_GW，以便外层复用
+get_interface_info() {
+    local iface="$1"
+    
+    CURRENT_DEV=$(ifstatus "$iface" | jsonfilter -e '@.l3_device' 2>/dev/null)
+    [ -z "$CURRENT_DEV" ] && CURRENT_DEV=$(ifstatus "$iface" | jsonfilter -e '@.device' 2>/dev/null)
+    CURRENT_IP=$(ifstatus "$iface" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
+    CURRENT_GW=$(ifstatus "$iface" | jsonfilter -e '@["route"][0].nexthop' 2>/dev/null)
+
+    if [ -z "$CURRENT_DEV" ] || [ -z "$CURRENT_IP" ]; then
+        log_warn "[$iface] 接口未就绪 (缺少物理设备或IP)，跳过"
+        return 1
+    fi
+    log_info "[$iface] 物理设备就绪 ($CURRENT_DEV | $CURRENT_IP | GW: ${CURRENT_GW:-未知})"
+    return 0
+}
+
+# 检查接口多播在线状态
+check_mwan_online() {
+    local iface="$1"
+    if [ "$FORCE_CHECK" = "false" ] && echo "$MWAN_STATUS" | grep -q "interface $iface is online"; then
+        log_succ "[$iface] mwan3 显示已在线，跳过认证"
+        return 0
+    fi
+    return 1
+}
+
+# 执行实际的登录请求
+# 返回值: 0 表示无需重试(成功或不可逆失败)，1 表示需继续重试
+perform_login() {
+    local iface="$1"
+    local dev="$2"
+    local ip="$3"
+    local raw_url="$4"
+
+    local wlanuserip=$(echo "$raw_url" | grep -o 'wlanuserip=[^&]*' | cut -d= -f2)
+    local wlanacname=$(echo "$raw_url" | grep -o 'wlanacname=[^&]*' | cut -d= -f2)
+    local mac=$(echo "$raw_url" | grep -o 'mac=[^&]*' | cut -d= -f2)
+    local vlan=$(echo "$raw_url" | grep -o 'vlan=[^&]*' | cut -d= -f2)
+    
+    [ -z "$wlanuserip" ] && wlanuserip=$ip
+
+    if [ -z "$mac" ] || [ -z "$wlanacname" ]; then
+        log_err "[$iface] 缺少关键参数 (MAC/ACName)，无法构造登录请求"
+        return 1
+    fi
+
+    local mac_encoded=$(echo "$mac" | sed 's/:/%3A/g')
+    local auth_api="http://${AUTH_HOST}/quickauth.do"
+    local params="userid=${USERNAME}&passwd=${PASSWORD}&wlanuserip=${wlanuserip}&wlanacname=${wlanacname}&mac=${mac_encoded}&vlan=${vlan}&version=0"
+    
+    log_info "[$iface] 发送快速认证请求 (MAC: $mac)..."
+    
+    local curl_args="-s -L --connect-timeout 3 --interface $dev -A \"$UA\""
+    local login_json=$(eval curl $curl_args "\"${auth_api}?${params}\"")
+    
+    local res_code=$(echo "$login_json" | jsonfilter -e '@.code' 2>/dev/null)
+    local res_msg=$(echo "$login_json" | jsonfilter -e '@.message' 2>/dev/null)
+
+    log_debug "[$iface] 服务器响应: $login_json"
+
+    case "$res_code" in
+        "0")
+            log_succ "[$iface] 认证成功！"
+            return 0
+            ;;
+        "1")
+            log_warn "[$iface] 失败: 不在上网时段 ($res_msg)"
+            return 0 # 不在时段属于逻辑限制，重试无意义，跳过该接口
+            ;;
+        "7")
+            log_err "[$iface] 致命错误: 账号或密码错误 ($res_msg)"
+            log_err "请检查脚本配置。为防止账号被锁定，将退出脚本。"
+            exit 1 # 密码错误非常危险，直接终止脚本运行
+            ;;
+        *)
+            if [ -z "$res_code" ]; then
+                log_err "[$iface] 认证异常: 响应体为空或非JSON格式"
+            else
+                log_err "[$iface] 认证失败 (Code: $res_code): $res_msg"
+            fi
+            return 1 # 未知错误或网络波动，允许重试
+            ;;
+    esac
+}
+
+# 单个接口的探测与认证重试封装
+do_probe_and_login() {
+    local iface="$1"
+    
+    for attempt in $(seq 1 $MAX_RETRIES); do
+        if [ "$attempt" -gt 1 ]; then
+            log_warn "[$iface] 探测失败，正在进行重试 ($attempt/$MAX_RETRIES)..."
+            sleep $RETRY_DELAY
+        fi
+
+        # 路由装载
+        cleanup_routes "$CURRENT_DEV" "$CURRENT_GW"
+        setup_routes "$CURRENT_DEV" "$CURRENT_GW"
+
+        # 发起探测
+        local curl_args="-s -L --connect-timeout 3 --interface $CURRENT_DEV -A \"$UA\""
+        log_debug "[$iface] 正向 $PROBE_TARGET 发起探测..."
+        
+        local probe_res=$(eval curl $curl_args -w \"\\n%{url_effective}\" \"http://$PROBE_TARGET\" 2>&1)
+        local final_url=$(echo "$probe_res" | tail -n 1)
+
+        # 无论成功失败，探测完立刻清理，保持强壮性
+        cleanup_routes "$CURRENT_DEV" "$CURRENT_GW"
+
+        # 逻辑分发
+        if echo "$probe_res" | grep -E -q "portal\.do|location\.replace"; then
+            log_info "[$iface] 状态: [未登录]，准备提取参数并发起认证..."
+            
+            local raw_url=$(echo "$probe_res" | grep -o "http://[^\"']*portal\.do?[^\"']*")
+            if [ -z "$raw_url" ]; then
+                log_err "[$iface] 提取重定向URL失败，网页结构可能已改变"
+                log_debug "[$iface] 探测到的原始响应: $probe_res"
+                continue # 触发下一次重试
+            fi
+            
+            log_debug "[$iface] 截获的认证跳转链接: $raw_url"
+            
+            # 交给登录函数处理
+            perform_login "$iface" "$CURRENT_DEV" "$CURRENT_IP" "$raw_url"
+            [ $? -eq 0 ] && break # 返回0表示成功或触发无需重试的异常，跳出循环
+            
+        elif echo "$probe_res" | grep -i -q "logout"; then
+            log_succ "[$iface] 状态: [已在线] (无需重复认证)"
+            if echo "$final_url" | grep -i -q "logout"; then
+                log_debug "[$iface] 截获的登出跳转链接: $final_url"
+            fi
+            break
+            
+        else
+            log_warn "[$iface] 未知网络状态，未检测到认证入口"
+            log_debug "[$iface] 异常网页内容: $probe_res"
+        fi
+    done
+}
+
+
+# ========== 主程序流程 ==========
+
+parse_args "$@"
+
+[ "$DEBUG_MODE" = "true" ] && log_info "调试模式已开启 (强制探测并输出 Debug 日志)"
+log_info "目标接口列表: $INTERFACES"
+
+# 全局环境初始化
 MWAN_STATUS=$(mwan3 status 2>/dev/null)
+TOTAL_IFS=$(echo "$INTERFACES" | wc -w)
+CURRENT_IF_INDEX=0
+
+# 注册异常中断监听 (Ctrl+C 等)
+trap 'echo -e "\n${C_WARN}脚本中断，正在清理路由...${C_RESET}"; cleanup_routes "$CURRENT_DEV" "$CURRENT_GW"; exit 1' INT TERM
+
+log_info "开始执行认证流程..."
 
 for IFACE in $INTERFACES; do
-    log "-------------------------------------------------"
+    CURRENT_IF_INDEX=$((CURRENT_IF_INDEX + 1))
     
-    # 1. 获取接口物理信息
-    # ifstatus 和 jsonfilter 是 OpenWrt 特有的强大工具
-    REAL_DEVICE=$(ifstatus "$IFACE" | jsonfilter -e '@.l3_device') 
-    [ -z "$REAL_DEVICE" ] && REAL_DEVICE=$(ifstatus "$IFACE" | jsonfilter -e '@.device')
-    IP_ADDR=$(ifstatus "$IFACE" | jsonfilter -e '@["ipv4-address"][0].address')
-    GATEWAY=$(ifstatus "$IFACE" | jsonfilter -e '@["route"][0].nexthop')
-
-    # 基础检查
-    if [ -z "$REAL_DEVICE" ] || [ -z "$IP_ADDR" ]; then
-        log "[$IFACE] -> 跳过: 接口未就绪 (无设备或无IP)。"
-        continue
-    fi
-
-    log ">>> 接口: [$IFACE] (Dev: $REAL_DEVICE | IP: $IP_ADDR | GW: ${GATEWAY:-未知})"
-
-    # 2. 判断是否在线 (利用 mwan3 状态作为快速筛选)
-    # 如果是 debug 模式，则无视 mwan3 状态，强制跑一遍流程
-    if [ "$FORCE_CHECK" = "false" ] && echo "$MWAN_STATUS" | grep -q "interface $IFACE is online"; then
-        log "[$IFACE] -> mwan3 显示在线。跳过 (节省资源)。"
-        continue
-    fi
-
-    # 3. 准备路由 (关键步骤)
-    # 强制让 2.2.2.2 和 10.5.0.11 走当前接口的网关
-    # 先尝试删除旧路由(防御性编程)，再添加新路由
-    cleanup_routes "$REAL_DEVICE" "$GATEWAY"
-    
-    if [ -n "$GATEWAY" ]; then
-        ip route add "$PROBE_TARGET" via "$GATEWAY" dev "$REAL_DEVICE" >/dev/null 2>&1
-        ip route add "$AUTH_HOST" via "$GATEWAY" dev "$REAL_DEVICE" >/dev/null 2>&1
-    fi
-
-    # 4. 发起探测
-    # -L: 跟随跳转 (虽然内网劫持通常直接返回HTML，但加上更保险)
-    # --connect-timeout: 设置超时，防止卡死
-    CURL_ARGS="-s -L --connect-timeout 3 --interface $REAL_DEVICE -A \"$UA\""
-    
-    # 如果是 debug 模式，加上 -v 打印握手头信息
-    if [ "$DEBUG_MODE" = "true" ]; then
-        log "    [DEBUG] 正向 $PROBE_TARGET 发起探测..."
-        PROBE_RES=$(eval curl -v $CURL_ARGS "http://$PROBE_TARGET" 2>&1)
-        echo "$PROBE_RES" | head -n 20 # 只打印前20行避免刷屏
-    else
-        PROBE_RES=$(eval curl $CURL_ARGS "http://$PROBE_TARGET" 2>&1)
-    fi
-
-    # 5. 分析探测结果
-    # 逻辑：如果返回内容里包含 "portal.do" 或者 "location.replace"，说明被劫持了，需要登录
-    if echo "$PROBE_RES" | grep -E -q "portal\.do|location\.replace"; then
-        log "[$IFACE] -> 状态: [未登录] (检测到认证跳转)，准备提取参数..."
-
-        # === 参数提取 (更健壮的正则) ===
-        # 尝试从 HTML 中提取包含参数的那个长 URL
-        # 匹配 http://...portal.do?... 后面非引号的字符
-        RAW_URL=$(echo "$PROBE_RES" | grep -o "http://[^\"']*portal\.do?[^\"']*")
-        
-        if [ -z "$RAW_URL" ]; then
-            log "[$IFACE] -> 错误: 无法从响应中提取跳转URL，可能网页结构已变。"
-        else
-            # 从 URL 中切割参数
-            WLAN_USER_IP=$(echo "$RAW_URL" | grep -o 'wlanuserip=[^&]*' | cut -d= -f2)
-            WLAN_AC_NAME=$(echo "$RAW_URL" | grep -o 'wlanacname=[^&]*' | cut -d= -f2)
-            MAC=$(echo "$RAW_URL" | grep -o 'mac=[^&]*' | cut -d= -f2)
-            VLAN=$(echo "$RAW_URL" | grep -o 'vlan=[^&]*' | cut -d= -f2)
-            
-            # 如果没取到 IP，兜底使用接口 IP
-            [ -z "$WLAN_USER_IP" ] && WLAN_USER_IP=$IP_ADDR
-
-            if [ -n "$MAC" ] && [ -n "$WLAN_AC_NAME" ]; then
-                # 构造登录请求
-                TIMESTAMP=$(date +%s%3N)
-                UUID=$(cat /proc/sys/kernel/random/uuid)
-                MAC_ENCODED=$(echo "$MAC" | sed 's/:/%3A/g')
-                
-                AUTH_API="http://${AUTH_HOST}/quickauth.do"
-                PARAMS="userid=${USERNAME}&passwd=${PASSWORD}&wlanuserip=${WLAN_USER_IP}&wlanacname=${WLAN_AC_NAME}&wlanacIp=${AC_IP}&mac=${MAC_ENCODED}&vlan=${VLAN}&version=0&portalpageid=1&timestamp=${TIMESTAMP}&uuid=${UUID}"
-                
-                log "[$IFACE] -> 发送登录请求 (MAC: $MAC)..."
-                
-                LOGIN_JSON=$(eval curl $CURL_ARGS "${AUTH_API}?${PARAMS}")
-
-                # === 结果解析 (处理不同状态码) ===
-                RES_CODE=$(echo "$LOGIN_JSON" | jsonfilter -e '@.code')
-                RES_MSG=$(echo "$LOGIN_JSON" | jsonfilter -e '@.message')
-
-                if [ "$DEBUG_MODE" = "true" ]; then
-                    echo "    [DEBUG] 服务器响应: $LOGIN_JSON"
-                fi
-
-                case "$RES_CODE" in
-                    "0")
-                        log "[$IFACE] -> >>> 认证成功! <<<"
-                        ;;
-                    "1")
-                        log "[$IFACE] -> 失败: 不在上网时段 ($RES_MSG)"
-                        # 这里可以考虑是否要 exit，或者只是跳过
-                        ;;
-                    "7")
-                        log "[$IFACE] -> 严重失败: 账号或密码错误! ($RES_MSG)"
-                        # 密码错通常意味着配置错了，继续重试可能会导致账号被锁
-                        exit 1 
-                        ;;
-                    *)
-                        if [ -z "$RES_CODE" ]; then
-                            log "[$IFACE] -> 异常: 响应非JSON格式或为空。"
-                        else
-                            log "[$IFACE] -> 未知错误 (Code: $RES_CODE): $RES_MSG"
-                        fi
-                        ;;
-                esac
-            else
-                log "[$IFACE] -> 错误: 关键参数(MAC/ACName)提取失败。"
-            fi
-        fi
-
-    elif echo "$PROBE_RES" | grep -i -q "logout"; then
-        log "[$IFACE] -> 状态: [已在线] (无需操作)。"
-    else
-        log "[$IFACE] -> 未知状态 (未检测到 Login 也未检测到 Logout)。"
-        if [ "$DEBUG_MODE" = "true" ]; then
-            echo "    [DEBUG] 响应内容: $PROBE_RES"
+    # 核心骨架 (短路求值逻辑)
+    if get_interface_info "$IFACE"; then
+        if ! check_mwan_online "$IFACE"; then
+            do_probe_and_login "$IFACE"
         fi
     fi
 
-    # 6. 清理路由 (恢复原状)
-    cleanup_routes "$REAL_DEVICE" "$GATEWAY"
-
-    # 避免并发请求过快
-    sleep $SLEEP_TIME
+    # 接口切换缓冲 (除最后一个接口外)
+    if [ "$CURRENT_IF_INDEX" -lt "$TOTAL_IFS" ]; then
+        sleep $SLEEP_TIME
+    fi
 done
 
-log "============ 结束 ============"
+log_info "认证流程全部结束"
